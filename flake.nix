@@ -19,8 +19,10 @@
 
   outputs =
     # `...` rather than a closed { self, nixpkgs }: adding a second input later
-    # would otherwise fail with "called with unexpected argument 'self'".
-    { nixpkgs, ... }:
+    # would otherwise fail with "called with unexpected argument 'flake-utils'".
+    # `self` is destructured because rootPreamble needs this flake's own source
+    # path -- see the comment there for why nothing else can supply it.
+    { self, nixpkgs, ... }:
     let
       lib = nixpkgs.lib;
 
@@ -131,19 +133,58 @@
       #                  `pytest` verb that collects zero items would report
       #                  green forever
       #
-      # `text` is bash under `set -euo pipefail`, shellcheck'd at BUILD time, and
-      # it runs in the caller's current directory so an agent can test
-      # uncommitted edits. Always end with a quoted "$@" -- unquoted $@ fails the
-      # build with SC2068 -- and reach for anything stateful through $REPO_ROOT,
-      # never a bare relative path.
+      # `text` is bash under `set -euo pipefail`, shellcheck'd at BUILD time. Two
+      # rules, and the first one is the whole ballgame:
+      #
+      #   1. ANCHOR EVERY PATH TO $REPO_ROOT. A verb must do the same thing from
+      #      any working directory and must never read or write one file outside
+      #      this repo, so every path argument defaults to $REPO_ROOT:
+      #      `"''${@:-$REPO_ROOT}"`. Ending at a bare "$@" leaves the tool to
+      #      supply its own default, and every default here is `.` -- which is
+      #      the CALLER's directory, not ours. That is not theoretical: with a
+      #      bare "$@", `nix run /path/to/repo#lint` (the flake-URL form CI and
+      #      a cold agent use) from an unrelated directory printed "All checks
+      #      passed!" having inspected zero of this repo's files while the same
+      #      verb exited 1 from inside the tree, and `nix run /path/to/repo#fmt`
+      #      REWROTE whatever Python was sitting in the caller's directory.
+      #   2. Quote the expansion. Unquoted $@ fails the build with SC2068, and
+      #      "''${@:-$REPO_ROOT}" keeps a path containing a space one argument.
+      #
+      # Explicit arguments are still forwarded verbatim and still resolve
+      # against the caller's cwd, because the default only fires when $# is 0.
       commands = pkgs: {
         lint = {
           description = "ruff check";
-          text = ''ruff check "$@"'';
+          # --no-cache is not a speed knob, it is part of the anchoring. ruff
+          # derives .ruff_cache from its OWN cwd and never from the paths it was
+          # handed, so an anchored `nix run /path/to/repo#lint` still dropped a
+          # .ruff_cache into the caller's tree -- a write outside the repo,
+          # which is the thing we are here to stop. Pointing that cache at the
+          # store snapshot instead does not degrade, it aborts the run:
+          #   error: Failed to initialize cache at /nix/store/...-source/.ruff_cache:
+          #   Read-only file system (os error 30)
+          # This tree is one 616-byte file; the cache saves nothing measurable.
+          text = ''ruff check --no-cache "''${@:-$REPO_ROOT}"'';
         };
         fmt = {
           description = "ruff format (rewrites files)";
-          text = ''ruff format "$@"'';
+          # The only mutating verb, so the only one that refuses to guess. With
+          # no arguments it formats $REPO_ROOT -- and when that is the read-only
+          # store snapshot (nobody invoked us from a checkout, see rootPreamble)
+          # there is nothing there that CAN be rewritten. Say so in one line,
+          # rather than letting ruff surface a permission-denied on /nix/store
+          # and leaving the reader to work out which directory it meant.
+          # Explicit paths are the caller's business, so they skip the guard.
+          text = ''
+            if [ "$#" -eq 0 ] && [ ! -w "$REPO_ROOT" ]; then
+              echo "dev-fmt rewrites files in place, so it needs a writable checkout." >&2
+              echo "REPO_ROOT is $REPO_ROOT -- this flake's read-only store snapshot," >&2
+              echo "so there is nothing here to format. Run dev-fmt from inside a" >&2
+              echo "checkout of this repo, or pass the paths to format explicitly." >&2
+              exit 1
+            fi
+            ruff format --no-cache "''${@:-$REPO_ROOT}"
+          '';
         };
         run = {
           # WARNING for agents: this script is interactive by design -- it calls
@@ -158,6 +199,12 @@
           # `python3` unqualified is correct here, unusually for this fleet:
           # there is no .venv to miss, so the store interpreter the wrapper
           # prepends is the only one and both surfaces agree.
+          #
+          # The script path was already spelled through $REPO_ROOT, but that was
+          # not enough while $REPO_ROOT itself was derived from the caller's cwd:
+          # from an unrelated directory this died with
+          # "can't open file '/somewhere/else/cheat_analysis.py'". It is honest
+          # now because rootPreamble is.
           description = "run the analysis script (prompts on stdin -- pipe input or it blocks)";
           text = ''python3 "$REPO_ROOT/cheat_analysis.py" "$@"'';
         };
@@ -177,12 +224,52 @@
           export LD_LIBRARY_PATH="${lib.makeLibraryPath (nativeLibs pkgs)}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         '';
 
-      # Every command gets $REPO_ROOT. `nix run` and `nix develop` both start in
-      # whatever directory they were invoked from, so a bare `.venv` silently
-      # forks a second environment as soon as an agent works from a subdirectory.
-      # Note we do NOT cd there: commands act on the caller's cwd on purpose.
+      # Every command gets $REPO_ROOT, and every verb above anchors its paths to
+      # it, so $REPO_ROOT has to mean THIS repo from every possible cwd.
+      #
+      # It used to be `git rev-parse --show-toplevel || pwd`, which is a question
+      # about the CALLER, not about us: run from an unrelated directory it
+      # answered with the caller's tree (or, outside git, literally `pwd`), and
+      # the mutating verb then rewrote files there. A wrapper sitting in the
+      # store cannot ask where the user's checkout is, so the answer is baked in
+      # at build time and the work tree is only an opt-in refinement:
+      #
+      #   1. ${self} -- the copy of this flake's source that nix necessarily
+      #      already made in the store to evaluate this file. Read-only, always
+      #      present, unambiguously this repo, and correct for the cold
+      #      `nix run /path/to/repo#lint` that CI and a fresh agent run.
+      #   2. the caller's git work tree, but only when it is a checkout of this
+      #      same repo. That is the `nix develop` / `nix run .#fmt` case, whose
+      #      whole point is linting and formatting edits that are not committed
+      #      yet, in place, in the files the author is actually looking at.
+      #
+      # "same repo" is decided by comparing flake.nix byte for byte, and
+      # deliberately erring strict: a false positive means writing into a
+      # stranger's tree, a false negative only means working on the snapshot.
+      # Nix copies a dirty work tree into the store as it stands, so an
+      # uncommitted edit to a tracked flake.nix still compares equal to itself.
+      # `$(<f)` is a bash redirect rather than cat: no process, and nothing extra
+      # required on PATH.
+      #
+      # Still no `cd`: with every path anchored there is nothing left for a cd to
+      # fix, and keeping the caller's cwd is what lets a relative path in an
+      # explicit argument (`dev-lint ./scratch.py`) still mean what was typed.
+      #
+      # Two prices, both paid knowingly. Referencing ${self} makes the source a
+      # dependency of the wrappers, so touching any tracked file rebuilds the
+      # three of them -- writeShellApplication plus shellcheck, a second or two.
+      # And a stale `nix develop` whose flake.nix has since been edited stops
+      # matching the work tree and falls back to its own snapshot; re-enter the
+      # shell, which you owe it anyway once the command map has changed. Nothing
+      # above is specific to this repo, so this block stays fleet-generic.
       rootPreamble = ''
-        REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+        FLAKE_ROOT=${lib.escapeShellArg self}
+        REPO_ROOT="$FLAKE_ROOT"
+        if worktree="$(git rev-parse --show-toplevel 2>/dev/null)" &&
+          [ -f "$worktree/flake.nix" ] &&
+          [ "$(<"$worktree/flake.nix")" = "$(<"$FLAKE_ROOT/flake.nix")" ]; then
+          REPO_ROOT="$worktree"
+        fi
         export REPO_ROOT
       '';
 
@@ -307,6 +394,41 @@
                   exit 1
                 }
               done
+              touch "$out"
+            '';
+
+        # Regression test for the anchoring, which is worth a derivation because
+        # the bug it guards against was invisible from inside the repo: every
+        # verb inherited the caller's cwd, so lint reported success over zero
+        # files and fmt rewrote sources that belonged to somebody else. The build
+        # sandbox is the ideal stranger's directory -- /build is not a git tree
+        # and contains nothing of ours -- so the assertion is simply that the
+        # verbs neither touch nor even mention what is sitting in it. Asserting
+        # exit codes instead would be a fake check: lint legitimately exits 1
+        # while cheat_analysis.py still has findings.
+        anchoring =
+          pkgs.runCommand "anchoring-check"
+            {
+              nativeBuildInputs = lib.attrValues (wrappers pkgs);
+            }
+            ''
+              printf 'import os,sys\nx=1\n' > decoy.py
+              cp decoy.py decoy.expected
+
+              dev-fmt > fmt.out 2>&1 || true
+              cmp decoy.py decoy.expected || {
+                echo "dev-fmt rewrote a file in the caller's directory:" >&2
+                cat fmt.out >&2
+                exit 1
+              }
+
+              dev-lint > lint.out 2>&1 || true
+              if grep -q decoy.py lint.out; then
+                echo "dev-lint inspected the caller's directory:" >&2
+                cat lint.out >&2
+                exit 1
+              fi
+
               touch "$out"
             '';
       });
