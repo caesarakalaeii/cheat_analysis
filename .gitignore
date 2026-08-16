@@ -164,3 +164,9 @@ cython_debug/
 result
 result-*
 .direnv/
+
+# Ruff
+#  The dev-lint and dev-fmt verbs pass --no-cache, but a bare `ruff check` at
+#  the prompt still writes this directory into whatever cwd it was run from,
+#  and one had already been left in this tree once.
+.ruff_cache/
